@@ -1,0 +1,214 @@
+name: Strike Force
+on:
+  workflow_dispatch:
+    inputs:
+      step:
+        description: "Which step to run"
+        required: true
+        type: choice
+        options:
+          - setup
+          - activate
+          - build
+
+permissions:
+  contents: write
+
+jobs:
+  setup:
+    if: ${{ inputs.step == 'setup' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write project files
+        run: |
+          mkdir -p Packages ProjectSettings Assets/Scripts Assets/Editor
+          cat > Packages/manifest.json <<'EOF_MANIFEST'
+          {
+            "dependencies": {
+              "com.unity.modules.androidjni": "1.0.0",
+              "com.unity.modules.audio": "1.0.0",
+              "com.unity.modules.imgui": "1.0.0",
+              "com.unity.modules.physics": "1.0.0",
+              "com.unity.modules.ui": "1.0.0"
+            }
+          }
+          EOF_MANIFEST
+          cat > ProjectSettings/ProjectVersion.txt <<'EOF_PV'
+          m_EditorVersion: 2022.3.20f1
+          EOF_PV
+          cat > Assets/Scripts/Bootstrap.cs <<'EOF_BOOT'
+          using UnityEngine;
+
+          // Builds a tiny scene at runtime so the project needs no hand-made scene file.
+          public static class Bootstrap
+          {
+              [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
+              private static void Init()
+              {
+                  var camGo = new GameObject("Main Camera");
+                  camGo.tag = "MainCamera";
+                  var cam = camGo.AddComponent<Camera>();
+                  cam.clearFlags = CameraClearFlags.SolidColor;
+                  cam.backgroundColor = new Color(0.05f, 0.05f, 0.08f);
+                  camGo.transform.position = new Vector3(0f, 1f, -4f);
+
+                  var lightGo = new GameObject("Sun");
+                  var light = lightGo.AddComponent<Light>();
+                  light.type = LightType.Directional;
+                  lightGo.transform.rotation = Quaternion.Euler(50f, -30f, 0f);
+
+                  var cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                  cube.transform.position = new Vector3(0f, 1f, 0f);
+                  cube.AddComponent<Spinner>();
+
+                  new GameObject("HUD").AddComponent<SmokeHud>();
+              }
+          }
+
+          public class Spinner : MonoBehaviour
+          {
+              private void Update()
+              {
+                  transform.Rotate(30f * Time.deltaTime, 45f * Time.deltaTime, 0f);
+              }
+          }
+
+          public class SmokeHud : MonoBehaviour
+          {
+              private float _fps;
+
+              private void Update()
+              {
+                  _fps = Mathf.Lerp(_fps, 1f / Mathf.Max(Time.unscaledDeltaTime, 0.0001f), 0.1f);
+              }
+
+              private void OnGUI()
+              {
+                  var style = new GUIStyle(GUI.skin.label) { fontSize = Mathf.RoundToInt(Screen.height * 0.05f) };
+                  GUI.Label(new Rect(20, 20, Screen.width, Screen.height * 0.2f),
+                      "STRIKE FORCE MOBILE - build OK\nFPS: " + _fps.ToString("F0"), style);
+              }
+          }
+          EOF_BOOT
+          cat > Assets/Editor/BuildScript.cs <<'EOF_BUILD'
+          using System;
+          using System.IO;
+          using UnityEditor;
+          using UnityEditor.Build;
+          using UnityEditor.Build.Reporting;
+          using UnityEditor.SceneManagement;
+
+          // Called by GameCI: buildMethod = BuildScript.BuildAndroid
+          public static class BuildScript
+          {
+              public static void BuildAndroid()
+              {
+                  Directory.CreateDirectory("Assets/Scenes");
+                  var scene = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
+                  const string scenePath = "Assets/Scenes/Main.unity";
+                  EditorSceneManager.SaveScene(scene, scenePath);
+
+                  PlayerSettings.companyName = "StrikeForce";
+                  PlayerSettings.productName = "Strike Force Mobile";
+                  PlayerSettings.SetApplicationIdentifier(NamedBuildTarget.Android, "com.strikeforce.mobile");
+                  PlayerSettings.SetScriptingBackend(NamedBuildTarget.Android, ScriptingImplementation.IL2CPP);
+                  PlayerSettings.Android.targetArchitectures = AndroidArchitecture.ARM64;
+                  PlayerSettings.Android.minSdkVersion = AndroidSdkVersions.AndroidApiLevel24;
+                  PlayerSettings.defaultInterfaceOrientation = UIOrientation.LandscapeLeft;
+                  EditorUserBuildSettings.buildAppBundle = false;
+
+                  string outPath = "build/Android/StrikeForce.apk";
+                  var args = Environment.GetCommandLineArgs();
+                  for (int i = 0; i < args.Length - 1; i++)
+                  {
+                      if (args[i] == "-customBuildPath") outPath = args[i + 1];
+                  }
+                  if (!outPath.EndsWith(".apk", StringComparison.OrdinalIgnoreCase))
+                      outPath = Path.Combine(outPath, "StrikeForce.apk");
+                  Directory.CreateDirectory(Path.GetDirectoryName(outPath));
+
+                  var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions
+                  {
+                      scenes = new[] { scenePath },
+                      target = BuildTarget.Android,
+                      locationPathName = outPath,
+                      options = BuildOptions.None
+                  });
+
+                  if (report.summary.result != BuildResult.Succeeded)
+                  {
+                      Console.Error.WriteLine("Build failed: " + report.summary.result);
+                      EditorApplication.Exit(1);
+                  }
+              }
+          }
+          EOF_BUILD
+      - name: Commit files
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add Packages ProjectSettings Assets
+          git commit -m "Add Unity smoke-test project files" || echo "nothing to commit"
+          git push
+
+  activate:
+    if: ${{ inputs.step == 'activate' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request activation file
+        id: alf
+        uses: game-ci/unity-request-activation-file@v2
+        with:
+          unityVersion: 2022.3.20f1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - name: Install activation tool
+        run: npm install --global unity-license-activate
+      - name: Activate license
+        continue-on-error: true
+        run: unity-license-activate "${{ secrets.UNITY_EMAIL }}" "${{ secrets.UNITY_PASSWORD }}" "${{ steps.alf.outputs.filePath }}" --authenticator-key "${{ secrets.UNITY_TOTP_KEY }}"
+      - name: Upload error screenshot (if any)
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot_error
+          path: error.png
+          if-no-files-found: ignore
+      - name: Read ulf
+        id: ulf
+        uses: juliangruber/read-file-action@v1.1.4
+        with:
+          path: ${{ env.ULF_FILE }}
+      - name: Save license as secret UNITY_LICENSE
+        uses: hmanzur/actions-set-secret@v2.0.0
+        with:
+          name: UNITY_LICENSE
+          value: ${{ steps.ulf.outputs.content }}
+          token: ${{ secrets.ACCESS_TOKEN }}
+
+  build:
+    if: ${{ inputs.step == 'build' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: Library
+          key: Library-Android-${{ hashFiles('Packages/manifest.json') }}
+          restore-keys: Library-Android-
+      - uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          unityVersion: 2022.3.20f1
+          targetPlatform: Android
+          buildMethod: BuildScript.BuildAndroid
+          buildName: StrikeForce
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StrikeForce-Android
+          path: build/Android
+          
